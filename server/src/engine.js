@@ -930,6 +930,191 @@ function buildInputLogSample(state) {
   return sample;
 }
 
+/* ================= 连续练习评判（目标序列 vs 实际触发，动态规划对齐） ================= */
+
+const MAX_PRACTICE_TARGETS = 20;
+
+const badPractice = (message) => Object.assign(new Error(message), { status: 400 });
+
+/**
+ * 动态规划对齐：把实际命令流与目标序列逐条对齐（编辑距离）。
+ * 成本：匹配 0；错命令（目标与实际对齐但命令不同）、漏命令（目标未被触发）、
+ * 多触发（实际触发未对应任何目标）各 1。
+ * 总成本相同时，回溯优先顺序：匹配 > 错命令 > 漏命令 > 多触发。
+ * 返回 { ops, cost }，ops 按目标/实际流的正序排列。
+ */
+function alignPracticeCommands(targetIds, actualIds) {
+  const m = targetIds.length;
+  const n = actualIds.length;
+  // dp[i][j]：前 i 个目标与前 j 个实际触发的最小对齐成本
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 1; i <= m; i++) dp[i][0] = i; // 目标全部漏命令
+  for (let j = 1; j <= n; j++) dp[0][j] = j; // 实际全部多触发
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const substitute = dp[i - 1][j - 1] + (targetIds[i - 1] === actualIds[j - 1] ? 0 : 1);
+      const miss = dp[i - 1][j] + 1; // 漏命令：目标 i 未对齐任何实际触发
+      const extra = dp[i][j - 1] + 1; // 多触发：实际 j 未对齐任何目标
+      dp[i][j] = Math.min(substitute, miss, extra);
+    }
+  }
+  // 回溯：同一格多个选择成本相同时，按 匹配 > 错命令 > 漏命令 > 多触发 取舍
+  const ops = [];
+  let i = m;
+  let j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && targetIds[i - 1] === actualIds[j - 1] && dp[i][j] === dp[i - 1][j - 1]) {
+      ops.push({ type: 'match', targetIndex: i - 1, actualIndex: j - 1 });
+      i--;
+      j--;
+    } else if (i > 0 && j > 0 && dp[i][j] === dp[i - 1][j - 1] + 1) {
+      ops.push({ type: 'wrong', targetIndex: i - 1, actualIndex: j - 1 });
+      i--;
+      j--;
+    } else if (i > 0 && dp[i][j] === dp[i - 1][j] + 1) {
+      ops.push({ type: 'missed', targetIndex: i - 1 });
+      i--;
+    } else {
+      ops.push({ type: 'extra', actualIndex: j - 1 });
+      j--;
+    }
+  }
+  ops.reverse();
+  return { ops, cost: dp[m][n] };
+}
+
+/**
+ * 连续练习评判（纯只读，不修改传入状态、不触碰持久化数据）：
+ * 1. 校验目标序列：1~20 个目标命令（可重复），任一目标未在该上下文生效
+ *    （不存在或被覆盖 shadowed）即整体拒绝（400）；
+ * 2. 录制非空时复用 replayTimeline 的时序回放规则（前缀待定 / 超时 / 重新起算，
+ *    非法按键、时间倒退、阈值非法同样整体 400）；空录制不回放，按全部漏命令处理；
+ * 3. 实际触发按时间展开，同一次触发中的多条命令（同层重复）按命令 id 升序排列；
+ * 4. 动态规划对齐实际命令流与目标序列，回溯优先 匹配 > 错命令 > 漏命令 > 多触发；
+ * 5. 返回逐项目标与实际命令、触发时刻、错误类型与总错误数。
+ *
+ * input:
+ *   { contextId, targets: [commandId, ...], timeoutMs?: 800,
+ *     presses?: [{ token | press, timeMs, timeoutMs? }] }   // 与时序回放同一格式，可为空
+ */
+function judgePractice(state, input, options = {}) {
+  const globalTimeout = Number.isFinite(Number(options.timeoutMs))
+    ? Number(options.timeoutMs)
+    : DEFAULT_REPLAY_TIMEOUT_MS;
+  if (!Number.isInteger(globalTimeout) || globalTimeout < 0) {
+    throw badPractice('超时阈值必须是非负整数毫秒');
+  }
+
+  const contextId = typeof input?.contextId === 'string' ? input.contextId.trim() : '';
+  if (!contextId) throw badPractice('连续练习需要 contextId（上下文 ID）');
+  const eff = computeEffective(state, contextId); // 上下文不存在：404
+
+  // 生效命令（shadowed 不生效）；同层重复的双方均为生效命令
+  const effectiveById = new Map();
+  for (const e of eff.entries) {
+    if (e.state !== 'shadowed') effectiveById.set(e.commandId, e);
+  }
+
+  // ---- 目标序列：1~20 个，可重复；未生效目标整体拒绝 ----
+  const rawTargets = Array.isArray(input?.targets) ? input.targets : null;
+  if (!rawTargets) throw badPractice('连续练习需要 targets（目标命令 id 数组）');
+  if (rawTargets.length === 0) throw badPractice('至少需要 1 个目标命令');
+  if (rawTargets.length > MAX_PRACTICE_TARGETS) {
+    throw badPractice(`目标命令最多 ${MAX_PRACTICE_TARGETS} 个，当前 ${rawTargets.length} 个`);
+  }
+  const targets = rawTargets.map((raw, idx) => {
+    const id = typeof raw === 'string' ? raw : raw && raw.commandId;
+    if (!id || typeof id !== 'string') throw badPractice(`第 ${idx + 1} 个目标缺少命令 id`);
+    const entry = effectiveById.get(id);
+    if (!entry) {
+      throw badPractice(
+        `第 ${idx + 1} 个目标命令未在上下文「${eff.contextPath}」生效（不存在或已被覆盖）：${id}`,
+      );
+    }
+    return {
+      index: idx + 1,
+      commandId: entry.commandId,
+      name: entry.name,
+      sequenceLabel: entry.sequenceLabel,
+      contextPath: entry.contextPath,
+    };
+  });
+
+  // ---- 录制：回放格式（可为空 —— 空录制按全部漏命令处理） ----
+  const rawPresses = input?.presses === undefined || input?.presses === null ? [] : input.presses;
+  if (!Array.isArray(rawPresses)) {
+    throw badPractice('presses 必须是带时间戳的按键数组（可为空，空录制按全部漏命令处理）');
+  }
+
+  let replay = null;
+  if (rawPresses.length > 0) {
+    // 复用时序回放：前缀待定 / 超时 / 重新起算；非法按键、时间倒退在此整体拒绝
+    replay = replayTimeline(state, contextId, { presses: rawPresses }, { timeoutMs: globalTimeout });
+  }
+
+  // ---- 实际触发按时间展开；同一次触发的多条命令按命令 id 升序 ----
+  const actual = [];
+  if (replay) {
+    for (const f of replay.fired) {
+      const sameFiring = [...f.commands].sort((a, b) =>
+        a.commandId < b.commandId ? -1 : a.commandId > b.commandId ? 1 : 0,
+      );
+      for (const c of sameFiring) {
+        actual.push({
+          seq: actual.length + 1,
+          commandId: c.commandId,
+          name: c.name,
+          sequenceLabel: c.sequenceLabel,
+          contextPath: c.contextPath,
+          duplicate: c.duplicate,
+          atMs: f.atMs,
+          eventType: f.eventType,
+        });
+      }
+    }
+  }
+
+  // ---- 动态规划对齐 ----
+  const { ops, cost } = alignPracticeCommands(
+    targets.map((t) => t.commandId),
+    actual.map((a) => a.commandId),
+  );
+  const alignment = ops.map((op, idx) => {
+    const row = { seq: idx + 1, type: op.type };
+    if (op.targetIndex !== undefined) {
+      row.targetIndex = op.targetIndex + 1; // 1-based，与 targets[].index 一致
+      row.target = targets[op.targetIndex];
+    }
+    if (op.actualIndex !== undefined) row.actual = actual[op.actualIndex];
+    return row;
+  });
+
+  const countOf = (type) => ops.filter((o) => o.type === type).length;
+  const stats = {
+    targetCount: targets.length,
+    actualCount: actual.length,
+    pressCount: rawPresses.length,
+    matchCount: countOf('match'),
+    wrongCount: countOf('wrong'),
+    missedCount: countOf('missed'),
+    extraCount: countOf('extra'),
+    totalErrors: cost, // = 错命令 + 漏命令 + 多触发
+  };
+
+  return {
+    format: 'shortcut-practice-judge-v1',
+    generatedAt: new Date().toISOString(),
+    contextId,
+    contextPath: eff.contextPath,
+    timeoutMs: globalTimeout,
+    targets,
+    actual,
+    alignment,
+    stats,
+    replay, // 完整时序回放结果（空录制为 null）
+  };
+}
+
 /** 收集某上下文子树内的全部叶子上下文（无子上下文） */
 function descendantLeaves(index, contextId) {
   const start = index.byId.get(contextId);
@@ -2416,6 +2601,9 @@ module.exports = {
   DEFAULT_REPLAY_TIMEOUT_MS,
   diagnoseInputLog,
   buildInputLogSample,
+  MAX_PRACTICE_TARGETS,
+  alignPracticeCommands,
+  judgePractice,
   descendantLeaves,
   conflictGoalId,
   minimumSetCover,

@@ -10,6 +10,8 @@ const {
   replayTimeline,
   diagnoseInputLog,
   buildInputLogSample,
+  alignPracticeCommands,
+  judgePractice,
   resolveConflicts,
   stateFingerprint,
   inspectDraftOps,
@@ -1321,6 +1323,282 @@ test('日志诊断：示例日志基于当前数据生成且能通过诊断', ()
   // 演示数据（含前缀链）下应出现段末超时结算与未命中
   assert.ok(r.stats.timeoutEventCount >= 1);
   assert.ok(r.stats.noMatchEventCount >= 1);
+});
+
+// ---------- 连续练习评判 ----------
+const practiceState = {
+  contexts: [
+    { id: 'p', parentId: null, name: 'P' },
+    { id: 'p-child', parentId: 'p', name: 'PChild' },
+  ],
+  commands: [
+    { id: 'pa', contextId: 'p', name: 'alpha', sequenceTokens: ['a'], sequenceLabel: 'A', description: '' },
+    { id: 'pb', contextId: 'p', name: 'beta', sequenceTokens: ['b'], sequenceLabel: 'B', description: '' },
+    { id: 'pc', contextId: 'p', name: 'gamma', sequenceTokens: ['c'], sequenceLabel: 'C', description: '' },
+    { id: 'pg', contextId: 'p', name: 'go', sequenceTokens: ['g'], sequenceLabel: 'G', description: '' },
+    { id: 'pgd', contextId: 'p', name: 'gd', sequenceTokens: ['g', 'd'], sequenceLabel: 'G D', description: '' },
+    // 同层重复：数据中 pdup-b 定义在前，但 id 升序 pdup-a 在前（验证展开按 id 排序而非数据顺序）
+    { id: 'pdup-b', contextId: 'p', name: 'dup-b', sequenceTokens: ['y'], sequenceLabel: 'Y', description: '' },
+    { id: 'pdup-a', contextId: 'p', name: 'dup-a', sequenceTokens: ['y'], sequenceLabel: 'Y', description: '' },
+    // 子上下文同序列覆盖：pshadow 在 p-child 中被 shadowed（未生效）
+    { id: 'pshadow', contextId: 'p', name: 'shadowed-x', sequenceTokens: ['x'], sequenceLabel: 'X', description: '' },
+    { id: 'pchildx', contextId: 'p-child', name: 'child-x', sequenceTokens: ['x'], sequenceLabel: 'X', description: '' },
+  ],
+};
+
+test('连续练习 DP 对齐：匹配 0 / 错命令 / 漏命令 / 多触发各 1', () => {
+  assert.deepEqual(alignPracticeCommands(['a'], ['a']), {
+    ops: [{ type: 'match', targetIndex: 0, actualIndex: 0 }],
+    cost: 0,
+  });
+  assert.deepEqual(alignPracticeCommands(['a'], ['b']), {
+    ops: [{ type: 'wrong', targetIndex: 0, actualIndex: 0 }],
+    cost: 1,
+  });
+  assert.deepEqual(alignPracticeCommands(['a'], []), {
+    ops: [{ type: 'missed', targetIndex: 0 }],
+    cost: 1,
+  });
+  assert.deepEqual(alignPracticeCommands([], ['a']), {
+    ops: [{ type: 'extra', actualIndex: 0 }],
+    cost: 1,
+  });
+});
+
+test('连续练习 DP 对齐：总成本相同时回溯优先 匹配 > 错命令 > 漏命令 > 多触发', () => {
+  // 目标 [a,a] 实际 [a]：匹配优先 —— 末尾目标与之匹配，首个目标漏命令
+  assert.deepEqual(alignPracticeCommands(['a', 'a'], ['a']).ops, [
+    { type: 'missed', targetIndex: 0 },
+    { type: 'match', targetIndex: 1, actualIndex: 0 },
+  ]);
+  // 目标 [a,b] 实际 [b,a]：错命令（对角）优先于 漏命令+多触发
+  assert.deepEqual(alignPracticeCommands(['a', 'b'], ['b', 'a']).ops, [
+    { type: 'wrong', targetIndex: 0, actualIndex: 0 },
+    { type: 'wrong', targetIndex: 1, actualIndex: 1 },
+  ]);
+  // 漏命令优先于多触发：目标 [a] 实际 [x,a] 之外再无更省方案
+  assert.deepEqual(alignPracticeCommands(['a'], ['x', 'a']).ops, [
+    { type: 'extra', actualIndex: 0 },
+    { type: 'match', targetIndex: 0, actualIndex: 1 },
+  ]);
+  // 错命令 + 多触发：目标 [a] 实际 [x,y]，回溯对错命令（对角）优先于多触发 ——
+  // 从末尾回溯时 a 与最后的 y 对齐为错命令，x 记为多触发，成本 2
+  assert.deepEqual(alignPracticeCommands(['a'], ['x', 'y']).ops, [
+    { type: 'extra', actualIndex: 0 },
+    { type: 'wrong', targetIndex: 0, actualIndex: 1 },
+  ]);
+});
+
+test('连续练习：全部匹配（含前缀待定后阈值内续键触发长序列）', () => {
+  const r = judgePractice(practiceState, {
+    contextId: 'p',
+    targets: ['pgd', 'pa'],
+    presses: [P('g', 0), P('d', 100), P('a', 300)],
+  });
+  assert.equal(r.format, 'shortcut-practice-judge-v1');
+  assert.equal(r.contextPath, 'P');
+  assert.deepEqual(
+    r.actual.map((a) => [a.commandId, a.atMs, a.eventType]),
+    [
+      ['pgd', 100, 'press'],
+      ['pa', 300, 'press'],
+    ],
+  );
+  assert.deepEqual(
+    r.alignment.map((o) => o.type),
+    ['match', 'match'],
+  );
+  assert.equal(r.stats.totalErrors, 0);
+  assert.equal(r.stats.matchCount, 2);
+  assert.equal(r.stats.pressCount, 3);
+  assert.ok(r.replay && r.replay.events[0].status === 'pending'); // 复用时序回放：前缀待定
+});
+
+test('连续练习：超时触发短序列计入实际流（触发时刻为截止时刻）', () => {
+  const r = judgePractice(practiceState, {
+    contextId: 'p',
+    targets: ['pg'],
+    presses: [P('g', 50)],
+  });
+  assert.deepEqual(
+    r.actual.map((a) => [a.commandId, a.atMs, a.eventType]),
+    [['pg', 850, 'timeout']], // 50 + 800
+  );
+  assert.equal(r.alignment[0].type, 'match');
+  assert.equal(r.alignment[0].actual.atMs, 850);
+  assert.equal(r.stats.totalErrors, 0);
+});
+
+test('连续练习：错命令 / 漏命令 / 多触发与重新起算', () => {
+  // 错命令：目标 pa，实际触发 pb
+  const wrong = judgePractice(practiceState, {
+    contextId: 'p',
+    targets: ['pa'],
+    presses: [P('b', 0)],
+  });
+  assert.deepEqual(
+    wrong.alignment.map((o) => o.type),
+    ['wrong'],
+  );
+  assert.equal(wrong.alignment[0].target.commandId, 'pa');
+  assert.equal(wrong.alignment[0].actual.commandId, 'pb');
+  assert.equal(wrong.stats.totalErrors, 1);
+  assert.equal(wrong.stats.wrongCount, 1);
+
+  // 漏命令：目标 [pa, pb]，实际只触发 pa
+  const missed = judgePractice(practiceState, {
+    contextId: 'p',
+    targets: ['pa', 'pb'],
+    presses: [P('a', 0)],
+  });
+  assert.deepEqual(
+    missed.alignment.map((o) => o.type),
+    ['match', 'missed'],
+  );
+  assert.equal(missed.alignment[1].target.commandId, 'pb');
+  assert.equal(missed.stats.missedCount, 1);
+
+  // 多触发 + 重新起算：z 无匹配被丢弃，a 重新起算命中；目标不含 pc
+  const extra = judgePractice(practiceState, {
+    contextId: 'p',
+    targets: ['pa'],
+    presses: [P('z', 0), P('a', 100), P('c', 200)],
+  });
+  assert.deepEqual(
+    extra.alignment.map((o) => o.type),
+    ['match', 'extra'],
+  );
+  assert.equal(extra.alignment[1].actual.commandId, 'pc');
+  assert.equal(extra.stats.extraCount, 1);
+  assert.equal(extra.stats.totalErrors, 1);
+  // 重新起算事件保留在回放明细中
+  assert.equal(extra.replay.events[1].restartFrom, true);
+});
+
+test('连续练习：同次多命令（同层重复）按命令 id 升序展开', () => {
+  const r = judgePractice(practiceState, {
+    contextId: 'p',
+    targets: ['pdup-a', 'pdup-b'],
+    presses: [P('y', 0)],
+  });
+  // 数据中 pdup-b 定义在前，但展开按 id 升序：pdup-a 先、pdup-b 后
+  assert.deepEqual(
+    r.actual.map((a) => a.commandId),
+    ['pdup-a', 'pdup-b'],
+  );
+  assert.ok(r.actual.every((a) => a.atMs === 0 && a.duplicate));
+  assert.deepEqual(
+    r.alignment.map((o) => o.type),
+    ['match', 'match'],
+  );
+  assert.equal(r.stats.totalErrors, 0);
+});
+
+test('连续练习：空录制按全部漏命令处理（presses 缺省或为空数组）', () => {
+  const emptyArray = judgePractice(practiceState, {
+    contextId: 'p',
+    targets: ['pa', 'pgd'],
+    presses: [],
+  });
+  assert.equal(emptyArray.replay, null);
+  assert.equal(emptyArray.stats.pressCount, 0);
+  assert.equal(emptyArray.stats.actualCount, 0);
+  assert.deepEqual(
+    emptyArray.alignment.map((o) => o.type),
+    ['missed', 'missed'],
+  );
+  assert.deepEqual(
+    emptyArray.alignment.map((o) => o.targetIndex),
+    [1, 2],
+  );
+  assert.equal(emptyArray.stats.missedCount, 2);
+  assert.equal(emptyArray.stats.totalErrors, 2);
+
+  const omitted = judgePractice(practiceState, { contextId: 'p', targets: ['pa'] });
+  assert.equal(omitted.stats.totalErrors, 1);
+  assert.deepEqual(
+    omitted.alignment.map((o) => o.type),
+    ['missed'],
+  );
+});
+
+test('连续练习：未生效目标整体拒绝（shadowed / 不存在 / 链外命令）', () => {
+  // 在 p-child 中 pshadow 被 pchildx 覆盖（shadowed），不是生效命令
+  assert.throws(
+    () => judgePractice(practiceState, { contextId: 'p-child', targets: ['pshadow'] }),
+    (err) => {
+      assert.equal(err.status, 400);
+      assert.match(err.message, /第 1 个目标.*未在上下文.*生效/);
+      return true;
+    },
+  );
+  // 不存在的命令
+  assert.throws(
+    () => judgePractice(practiceState, { contextId: 'p', targets: ['nope'] }),
+    /未在上下文.*生效/,
+  );
+  // 链外命令：pchildx 不在 p 的祖先链上
+  assert.throws(
+    () => judgePractice(practiceState, { contextId: 'p', targets: ['pchildx'] }),
+    /未在上下文.*生效/,
+  );
+  // 目标数量：0 个或超过 20 个
+  assert.throws(() => judgePractice(practiceState, { contextId: 'p', targets: [] }), /至少需要 1 个/);
+  assert.throws(
+    () => judgePractice(practiceState, { contextId: 'p', targets: Array(21).fill('pa') }),
+    /最多 20 个/,
+  );
+  // 目标可重复：同一命令 20 个合法
+  const repeated = judgePractice(practiceState, { contextId: 'p', targets: Array(20).fill('pa') });
+  assert.equal(repeated.stats.targetCount, 20);
+  assert.equal(repeated.stats.totalErrors, 20); // 空录制：全部漏命令
+  // 缺少 targets / contextId；上下文不存在
+  assert.throws(() => judgePractice(practiceState, { contextId: 'p' }), /targets/);
+  assert.throws(() => judgePractice(practiceState, { targets: ['pa'] }), /contextId/);
+  assert.throws(
+    () => judgePractice(practiceState, { contextId: 'nope', targets: ['pa'] }),
+    (err) => {
+      assert.equal(err.status, 404);
+      return true;
+    },
+  );
+});
+
+test('连续练习：非法按键 / 倒退时间 / 非法阈值整体拒绝', () => {
+  assert.throws(
+    () => judgePractice(practiceState, { contextId: 'p', targets: ['pa'], presses: [P('ctrl+alt', 0)] }),
+    (err) => {
+      assert.equal(err.status, 400);
+      assert.match(err.message, /第 1 次按键无效/);
+      return true;
+    },
+  );
+  assert.throws(
+    () =>
+      judgePractice(practiceState, {
+        contextId: 'p',
+        targets: ['pa'],
+        presses: [P('a', 10), P('b', 5)],
+      }),
+    /单调不减/,
+  );
+  assert.throws(
+    () => judgePractice(practiceState, { contextId: 'p', targets: ['pa'], presses: [P('a', -1)] }),
+    /timeMs/,
+  );
+  assert.throws(
+    () => judgePractice(practiceState, { contextId: 'p', targets: ['pa'], presses: [P('a', 0, -3)] }),
+    /timeoutMs/,
+  );
+  assert.throws(
+    () => judgePractice(practiceState, { contextId: 'p', targets: ['pa'] }, { timeoutMs: -1 }),
+    /超时阈值/,
+  );
+  // presses 非数组
+  assert.throws(
+    () => judgePractice(practiceState, { contextId: 'p', targets: ['pa'], presses: 'a' }),
+    /presses/,
+  );
 });
 
 console.log(`\n引擎测试全部通过：${passed} 项`);

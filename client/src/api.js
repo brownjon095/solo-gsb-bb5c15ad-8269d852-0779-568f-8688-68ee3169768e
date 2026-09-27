@@ -31,6 +31,7 @@ export const api = {
     request(`/replay/${contextId}`, { method: 'POST', body: JSON.stringify(body) }),
   logDiagnose: (body) => request('/log-diagnose', { method: 'POST', body: JSON.stringify(body) }),
   logSample: () => request('/log-diagnose/sample'),
+  practiceJudge: (body) => request('/practice/judge', { method: 'POST', body: JSON.stringify(body) }),
   regressionSuite: () => request('/regression-suite'),
   sandboxPreview: (draft) =>
     request('/sandbox/preview', { method: 'POST', body: JSON.stringify(draft) }),

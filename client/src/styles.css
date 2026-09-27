@@ -1507,3 +1507,128 @@ select:focus {
   border-color: rgba(245, 181, 68, 0.5);
   background: rgba(245, 181, 68, 0.1);
 }
+
+/* ---- 连续练习 ---- */
+.practice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+}
+.practice-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 14px 12px;
+  margin-bottom: 12px;
+}
+.practice-grid .practice-panel {
+  margin-bottom: 0;
+}
+.practice-panel h3 {
+  margin: 2px 0 8px;
+  font-size: 13.5px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.practice-panel h3 .link-danger {
+  margin-left: auto;
+  font-size: 12px;
+}
+.practice-cmd-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 280px;
+  overflow: auto;
+}
+.practice-cmd {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.16);
+  font-size: 12.5px;
+}
+.practice-cmd.target {
+  background: rgba(91, 157, 255, 0.07);
+  border: 1px solid rgba(91, 157, 255, 0.18);
+}
+.practice-cmd-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.practice-cmd kbd.seq {
+  margin-left: auto;
+}
+.practice-target-index {
+  color: var(--accent);
+  font-family: ui-monospace, monospace;
+  font-size: 11.5px;
+  min-width: 26px;
+}
+.practice-add {
+  padding: 0 8px;
+  line-height: 1.6;
+}
+.practice-target-ops {
+  display: inline-flex;
+  gap: 2px;
+}
+.practice-target-ops button {
+  padding: 0 6px;
+  line-height: 1.6;
+}
+.practice-cmd .practice-add,
+.practice-cmd .practice-target-ops {
+  flex-shrink: 0;
+}
+.align-table td {
+  vertical-align: middle;
+}
+.align-cmd {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+.align-index {
+  color: var(--muted);
+  font-style: normal;
+  font-size: 11px;
+}
+.evt-badge.align-match {
+  color: var(--ok);
+  background: rgba(62, 207, 142, 0.12);
+  border: 1px solid rgba(62, 207, 142, 0.4);
+}
+.evt-badge.align-wrong {
+  color: var(--danger);
+  background: rgba(240, 107, 122, 0.12);
+  border: 1px solid rgba(240, 107, 124, 0.4);
+}
+.evt-badge.align-missed {
+  color: var(--warn);
+  background: rgba(245, 181, 68, 0.12);
+  border: 1px solid rgba(245, 181, 68, 0.35);
+}
+.evt-badge.align-extra {
+  color: #d9c8ff;
+  background: rgba(177, 140, 255, 0.16);
+  border: 1px solid rgba(177, 140, 255, 0.4);
+}
+.row-align-match {
+  background: rgba(62, 207, 142, 0.05);
+}
+.row-align-wrong {
+  background: rgba(240, 107, 124, 0.06);
+}
+.row-align-missed {
+  background: rgba(245, 181, 68, 0.05);
+}
+.row-align-extra {
+  background: rgba(177, 140, 255, 0.06);
+}

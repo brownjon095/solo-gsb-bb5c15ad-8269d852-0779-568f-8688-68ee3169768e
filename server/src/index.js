@@ -12,6 +12,7 @@ const {
   replayTimeline,
   diagnoseInputLog,
   buildInputLogSample,
+  judgePractice,
   resolveConflicts,
   checkMigration,
 } = require('./engine');
@@ -134,6 +135,26 @@ app.post(
     });
     if (req.query.download !== undefined) {
       res.setHeader('Content-Disposition', 'attachment; filename="input-log-report.json"');
+    }
+    res.json(result);
+  }),
+);
+
+// ---- 连续练习评判（只读：复用时序回放展开实际触发，动态规划对齐目标序列） ----
+// POST body:
+//   { contextId: "ctx-code",
+//     targets: ["cmd-10", "cmd-11", ...],              // 1~20 个目标命令（可重复），须在该上下文生效
+//     timeoutMs?: 800,
+//     presses?: [{ token: "g", timeMs: 0, timeoutMs?: 800 }, ...] }  // 回放格式，可为空（全部漏命令）
+// 未生效目标 / 非法按键 / 时间倒退 / 阈值非法均整体 400，不生成部分结果。
+app.post(
+  '/api/practice/judge',
+  wrap((req, res) => {
+    const result = judgePractice(store.snapshot(), req.body || {}, {
+      timeoutMs: (req.body || {}).timeoutMs,
+    });
+    if (req.query.download !== undefined) {
+      res.setHeader('Content-Disposition', 'attachment; filename="practice-judge-result.json"');
     }
     res.json(result);
   }),
