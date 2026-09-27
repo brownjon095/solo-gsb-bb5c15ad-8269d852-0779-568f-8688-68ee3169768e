@@ -9,6 +9,7 @@ import Sandbox from './components/Sandbox';
 import ConflictResolver from './components/ConflictResolver';
 import MigrationCheck from './components/MigrationCheck';
 import LogDiagnostics from './components/LogDiagnostics';
+import Practice from './components/Practice';
 
 export default function App() {
   const [state, setState] = useState({ contexts: [], commands: [] });
@@ -16,7 +17,7 @@ export default function App() {
   const [review, setReview] = useState(null);
   const [globalError, setGlobalError] = useState('');
   const [loading, setLoading] = useState(true);
-  const [view, setView] = useState('review'); // review | migration | regression | sandbox | log
+  const [view, setView] = useState('review'); // review | migration | regression | sandbox | log | practice
 
   const refresh = useCallback(async () => {
     const s = await api.getState();
@@ -149,6 +150,12 @@ export default function App() {
           >
             📄 日志诊断
           </button>
+          <button
+            className={view === 'practice' ? 'tab active' : 'tab'}
+            onClick={() => setView('practice')}
+          >
+            🎯 连续练习
+          </button>
         </nav>
       </header>
 
@@ -161,6 +168,10 @@ export default function App() {
       ) : view === 'log' ? (
         <div className="regression-layout">
           <LogDiagnostics />
+        </div>
+      ) : view === 'practice' ? (
+        <div className="regression-layout">
+          <Practice state={state} />
         </div>
       ) : view === 'regression' ? (
         <div className="regression-layout">

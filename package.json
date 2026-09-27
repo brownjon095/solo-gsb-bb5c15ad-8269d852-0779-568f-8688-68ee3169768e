@@ -12,7 +12,7 @@
     "build": "npm run build -w client",
     "start": "node server/src/index.js",
     "test:engine": "node server/test/engine.test.js",
-    "test:api": "node server/test/publish.api.test.js && node server/test/migration.api.test.js && node server/test/logdiagnose.api.test.js",
+    "test:api": "node server/test/publish.api.test.js && node server/test/migration.api.test.js && node server/test/logdiagnose.api.test.js && node server/test/practice.api.test.js",
     "test": "npm run test:engine && npm run test:api"
   },
   "devDependencies": {

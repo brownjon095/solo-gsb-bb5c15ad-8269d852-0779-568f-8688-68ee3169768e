@@ -40,4 +40,6 @@ export const api = {
     request(`/conflicts/resolve/${contextId}`, { method: 'POST', body: JSON.stringify(body) }),
   migrationCheck: (direction) =>
     request(`/migration-check?direction=${encodeURIComponent(direction || 'ctrl-to-meta')}`),
+  practiceJudge: (contextId, body) =>
+    request(`/practice/judge/${contextId}`, { method: 'POST', body: JSON.stringify(body) }),
 };

@@ -17,7 +17,10 @@ const {
   mapPressToken,
   mapSequenceTokens,
   checkMigration,
+  alignCommandStreams,
+  judgePractice,
 } = require('../src/engine');
+const seedState = require('../src/seed');
 
 let passed = 0;
 const test = (name, fn) => {
@@ -1321,6 +1324,208 @@ test('日志诊断：示例日志基于当前数据生成且能通过诊断', ()
   // 演示数据（含前缀链）下应出现段末超时结算与未命中
   assert.ok(r.stats.timeoutEventCount >= 1);
   assert.ok(r.stats.noMatchEventCount >= 1);
+});
+
+/* ================= 连续练习评判（目标编排 + 时序回放 + DP 对齐） ================= */
+
+// 评判演示数据：c10=G（前缀，待定），c11=G D，c12=G D D
+const practicePerfect = {
+  targets: ['cmd-12'],
+  timeoutMs: 800,
+  presses: [
+    { token: 'g', timeMs: 0 },
+    { token: 'd', timeMs: 100 },
+    { token: 'd', timeMs: 200 },
+  ],
+};
+
+test('练习评判：阈值内续键命中目标，成本 0', () => {
+  const r = judgePractice(seedState, 'ctx-code', practicePerfect);
+  assert.equal(r.format, 'shortcut-practice-report-v1');
+  assert.equal(r.totalCost, 0);
+  assert.deepEqual(r.stats, { matchedCount: 1, wrongCount: 0, missedCount: 0, extraCount: 0, totalErrors: 0 });
+  assert.equal(r.emptyRecording, false);
+  assert.equal(r.alignment.length, 1);
+  assert.equal(r.alignment[0].type, 'match');
+  assert.equal(r.alignment[0].target.commandId, 'cmd-12');
+  assert.equal(r.alignment[0].actual.commandId, 'cmd-12');
+  assert.equal(r.alignment[0].actual.atMs, 200);
+  assert.equal(r.alignment[0].actual.eventType, 'press');
+});
+
+test('练习评判：目标可重复，同序列触发多次分别匹配', () => {
+  const r = judgePractice(seedState, 'ctx-code', {
+    targets: ['cmd-12', 'cmd-12'],
+    presses: [
+      { token: 'g', timeMs: 0 }, { token: 'd', timeMs: 100 }, { token: 'd', timeMs: 200 },
+      { token: 'g', timeMs: 500 }, { token: 'd', timeMs: 600 }, { token: 'd', timeMs: 700 },
+    ],
+  });
+  assert.equal(r.totalCost, 0);
+  assert.equal(r.stats.matchedCount, 2);
+  assert.deepEqual(r.actual.map((a) => [a.commandId, a.atMs]), [
+    ['cmd-12', 200],
+    ['cmd-12', 700],
+  ]);
+});
+
+test('练习评判：空录制按全部漏命令处理（不回放）', () => {
+  const r = judgePractice(seedState, 'ctx-code', { targets: ['cmd-11', 'cmd-12'], presses: [] });
+  assert.equal(r.emptyRecording, true);
+  assert.equal(r.replay, null);
+  assert.equal(r.pressCount, 0);
+  assert.equal(r.actualCount, 0);
+  assert.equal(r.durationMs, 0);
+  assert.equal(r.totalCost, 2);
+  assert.deepEqual(r.alignment.map((x) => x.type), ['miss', 'miss']);
+  assert.equal(r.alignment[0].target.commandId, 'cmd-11');
+  // presses 缺省同样视为空录制
+  const r2 = judgePractice(seedState, 'ctx-code', { targets: ['cmd-11'] });
+  assert.equal(r2.totalCost, 1);
+  assert.equal(r2.alignment[0].type, 'miss');
+});
+
+test('练习评判：超时触发待定短序列，与单键目标匹配', () => {
+  const r = judgePractice(seedState, 'ctx-code', {
+    targets: ['cmd-10'], // G：单键，是 G D / G D D 前缀
+    presses: [{ token: 'g', timeMs: 0 }], // 时间线结束按超时在 800ms 结算
+  });
+  assert.equal(r.totalCost, 0);
+  assert.equal(r.actual.length, 1);
+  assert.equal(r.actual[0].commandId, 'cmd-10');
+  assert.equal(r.actual[0].atMs, 800);
+  assert.equal(r.actual[0].eventType, 'timeout');
+});
+
+test('练习评判：实际触发按时间展开，同一时刻多命令按命令 ID 升序', () => {
+  // Terminal 的 G H 是同层重复（cmd-17 / cmd-18），同一时刻一起触发
+  const r = judgePractice(seedState, 'ctx-terminal', {
+    targets: ['cmd-17', 'cmd-18'],
+    presses: [{ token: 'g', timeMs: 0 }, { token: 'h', timeMs: 100 }],
+  });
+  assert.equal(r.totalCost, 0);
+  assert.deepEqual(r.actual.map((a) => a.commandId), ['cmd-17', 'cmd-18']);
+  assert.deepEqual(r.actual.map((a) => a.atMs), [100, 100]);
+});
+
+test('练习评判：目标顺序反向时，DP 把重复命令流与重复目标正确对齐（匹配优先）', () => {
+  // Terminal：目标 [cmd-18, cmd-17] 顺序与同刻 ID 升序流相反，第一目标为“错命令”
+  const r = judgePractice(seedState, 'ctx-terminal', {
+    targets: ['cmd-18', 'cmd-17'],
+    presses: [{ token: 'g', timeMs: 0 }, { token: 'h', timeMs: 100 }],
+  });
+  assert.equal(r.totalCost, 2);
+  assert.deepEqual(r.alignment.map((x) => [x.type, x.target.commandId, x.actual.commandId]), [
+    ['wrong', 'cmd-18', 'cmd-17'],
+    ['wrong', 'cmd-17', 'cmd-18'],
+  ]);
+});
+
+test('练习评判：错命令 + 多触发综合对齐', () => {
+  // 目标仅 cmd-11（G D），实际超时触发 cmd-10（G）+ 后续再触发一次 cmd-10
+  const r = judgePractice(seedState, 'ctx-code', {
+    targets: ['cmd-11'],
+    presses: [{ token: 'g', timeMs: 0 }, { token: 'g', timeMs: 1200 }],
+  });
+  const types = r.alignment.map((x) => x.type).sort();
+  assert.deepEqual(types, ['extra', 'wrong']);
+  assert.equal(r.stats.wrongCount, 1);
+  assert.equal(r.stats.extraCount, 1);
+  assert.equal(r.stats.missedCount, 0);
+  assert.equal(r.totalCost, 2);
+});
+
+test('DP 对齐：平局时回溯优先 匹配/错命令 → 漏命令 → 多触发', () => {
+  const mk = (id) => ({ commandId: id });
+  // targets[A,B], actual[X]（总成本 2）：回溯到 (2,1) 时对角=错命令(B,X) 与
+  // 上行=漏命令(B) 同成本，按回溯优先取对角错命令 => 正向 [漏(A), 错(B,X)]
+  let a = alignCommandStreams([mk('A'), mk('B')], [mk('X')]);
+  assert.equal(a.totalCost, 2);
+  assert.deepEqual(a.rows.map((x) => x.type), ['miss', 'wrong']);
+  // targets[A], actual[X,Y]：回溯到 (1,2) 时对角=错命令(A,Y) 与左行=多触发(Y)
+  // 同成本，错命令优先 => 正向 [多(X), 错(A,Y)]
+  a = alignCommandStreams([mk('A')], [mk('X'), mk('Y')]);
+  assert.deepEqual(a.rows.map((x) => x.type), ['extra', 'wrong']);
+  // 匹配可免费时优先匹配而非漏/错：targets[A,B], actual[B]
+  a = alignCommandStreams([mk('A'), mk('B')], [mk('B')]);
+  assert.deepEqual(a.rows.map((x) => x.type), ['miss', 'match']);
+  assert.equal(a.totalCost, 1);
+  // 全匹配
+  a = alignCommandStreams([mk('A'), mk('B')], [mk('A'), mk('B')]);
+  assert.equal(a.totalCost, 0);
+  assert.ok(a.rows.every((x) => x.type === 'match'));
+});
+
+test('练习评判：未生效目标（shadowed / 不存在）整体 400 并带目标位置', () => {
+  // cmd-8 是 Editor 的「跳转… G」，在 ctx-code 被 cmd-10 覆盖，不生效
+  assert.throws(
+    () => judgePractice(seedState, 'ctx-code', { targets: ['cmd-8'], presses: [] }),
+    (err) => err.status === 400 && err.details.targetSeq === 1 && err.details.commandId === 'cmd-8',
+  );
+  assert.throws(
+    () => judgePractice(seedState, 'ctx-code', { targets: ['nope'], presses: [] }),
+    (err) => err.status === 400 && err.details.targetSeq === 1,
+  );
+});
+
+test('练习评判：目标数量越界 / 缺失整体 400', () => {
+  assert.throws(
+    () => judgePractice(seedState, 'ctx-code', { targets: [], presses: [] }),
+    (err) => err.status === 400,
+  );
+  assert.throws(
+    () => judgePractice(seedState, 'ctx-code', { targets: Array(21).fill('cmd-10') }),
+    (err) => err.status === 400,
+  );
+  assert.throws(
+    () => judgePractice(seedState, 'ctx-code', { presses: [] }),
+    (err) => err.status === 400,
+  );
+});
+
+test('练习评判：非法按键 / 时间倒退 / 阈值非法整体 400 并带按键位置', () => {
+  assert.throws(
+    () => judgePractice(seedState, 'ctx-code', {
+      targets: ['cmd-10'],
+      presses: [{ token: 'ctrl', timeMs: 0 }],
+    }),
+    (err) => err.status === 400 && err.details.pressSeq === 1,
+  );
+  assert.throws(
+    () => judgePractice(seedState, 'ctx-code', {
+      targets: ['cmd-10'],
+      presses: [{ token: 'g', timeMs: 100 }, { token: 'd', timeMs: 50 }],
+    }),
+    (err) => err.status === 400 && err.details.pressSeq === 2,
+  );
+  assert.throws(
+    () => judgePractice(seedState, 'ctx-code', {
+      targets: ['cmd-10'],
+      presses: [{ token: 'g', timeMs: 0, timeoutMs: -1 }],
+    }),
+    (err) => err.status === 400 && err.details.pressSeq === 1,
+  );
+  assert.throws(
+    () => judgePractice(seedState, 'ctx-code', { targets: ['cmd-10'], timeoutMs: -1, presses: [] }),
+    (err) => err.status === 400,
+  );
+});
+
+test('练习评判：上下文不存在返回 404', () => {
+  assert.throws(
+    () => judgePractice(seedState, 'no-such-context', { targets: ['cmd-10'] }),
+    (err) => err.status === 404,
+  );
+});
+
+test('练习评判：结果包含目标清单、实际流与完整回放明细', () => {
+  const r = judgePractice(seedState, 'ctx-code', practicePerfect);
+  assert.equal(r.targets.length, 1);
+  assert.equal(r.targets[0].targetSeq, 1);
+  assert.equal(r.targets[0].sequenceLabel, 'g d d');
+  assert.equal(r.contextPath, 'App / Editor / Code Editor');
+  assert.ok(r.replay && r.replay.format === 'shortcut-replay-v1');
+  assert.ok(r.replay.events.length >= 3);
 });
 
 console.log(`\n引擎测试全部通过：${passed} 项`);

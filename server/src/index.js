@@ -14,6 +14,7 @@ const {
   buildInputLogSample,
   resolveConflicts,
   checkMigration,
+  judgePractice,
 } = require('./engine');
 
 const app = express();
@@ -228,6 +229,26 @@ app.get('/api/migration-check', (req, res, next) => {
     next(err);
   }
 });
+
+// ---- 连续练习评判（只读：目标编排 + 录制时间线复用时序回放 + DP 对齐评判） ----
+// POST body:
+//   { targets: [commandId, ...],                     // 1~20 个生效命令，可重复
+//     timeoutMs?: 800,
+//     presses?: [{ token: "g", timeMs: 0, timeoutMs?: 800 }, ...] }  // 空录制可省略/为空数组
+// 未生效目标、非法按键、时间倒退等均整体 400（错误 details 带目标/按键位置）；
+// 空录制合法：跳过回放，全部目标按漏命令处理。不修改任何数据。
+app.post(
+  '/api/practice/judge/:contextId',
+  wrap((req, res) => {
+    const result = judgePractice(store.snapshot(), req.params.contextId, req.body || {}, {
+      timeoutMs: (req.body || {}).timeoutMs,
+    });
+    if (req.query.download !== undefined) {
+      res.setHeader('Content-Disposition', 'attachment; filename="practice-result.json"');
+    }
+    res.json(result);
+  }),
+);
 
 // ---- 错误处理 ----
 app.use('/api', (err, req, res, next) => {

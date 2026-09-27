@@ -399,6 +399,41 @@ function groupsToTriggered(exactGroups) {
 const badReplay = (message) => Object.assign(new Error(message), { status: 400 });
 
 /**
+ * 解析带相对毫秒的按键列表并做全量校验（按键格式 / 非负时间 / 单调不减 / 阈值合法）。
+ * replayTimeline 与连续练习评判共用，保证两条只读能力的校验口径完全一致。
+ * errorFactory(message, index0)：index0 为非法按键的 0-based 位置（整体时间线
+ * 非法等无具体位置的错误为 null）。
+ */
+function parsePressList(rawPresses, { globalTimeout, allowEmpty = false, errorFactory = badReplay } = {}) {
+  if (!Array.isArray(rawPresses)) throw errorFactory('需要 presses（带时间戳的按键数组）');
+  if (!allowEmpty && rawPresses.length === 0) throw errorFactory('至少需要一次按键');
+  const presses = [];
+  for (const p of rawPresses) {
+    const rawPress = p && typeof p === 'object' ? p.press ?? p.token : p;
+    const canonical = canonicalPress(rawPress);
+    if (!canonical.ok) throw errorFactory(`第 ${presses.length + 1} 次按键无效：${canonical.error}`, presses.length);
+    const t = Number(p && p.timeMs);
+    if (!Number.isFinite(t) || t < 0) {
+      throw errorFactory(`第 ${presses.length + 1} 次按键的 timeMs 必须是非负数`, presses.length);
+    }
+    let timeoutMs = globalTimeout;
+    if (p && p.timeoutMs !== undefined && p.timeoutMs !== null) {
+      timeoutMs = Number(p.timeoutMs);
+      if (!Number.isInteger(timeoutMs) || timeoutMs < 0) {
+        throw errorFactory(`第 ${presses.length + 1} 次按键的 timeoutMs 必须是非负整数毫秒`, presses.length);
+      }
+    }
+    presses.push({ token: canonical.token, pretty: canonical.pretty, timeMs: t, timeoutMs });
+  }
+  for (let i = 1; i < presses.length; i++) {
+    if (presses[i].timeMs < presses[i - 1].timeMs) {
+      throw errorFactory(`第 ${i + 1} 次按键的时间早于上一次，时间线必须单调不减`, i);
+    }
+  }
+  return presses;
+}
+
+/**
  * 时序回放：按带相对时间戳的按键时间线，复用 computeEffective 的生效绑定判定。
  *
  * 规则：
@@ -422,29 +457,7 @@ function replayTimeline(state, contextId, input, options = {}) {
 
   const rawPresses = Array.isArray(input?.presses) ? input.presses : null;
   if (!rawPresses) throw badReplay('回放需要 presses（带时间戳的按键数组）');
-  if (rawPresses.length === 0) throw badReplay('回放至少需要一次按键');
-
-  const presses = [];
-  for (const p of rawPresses) {
-    const rawPress = p && typeof p === 'object' ? p.press ?? p.token : p;
-    const canonical = canonicalPress(rawPress);
-    if (!canonical.ok) throw badReplay(`第 ${presses.length + 1} 次按键无效：${canonical.error}`);
-    const t = Number(p && p.timeMs);
-    if (!Number.isFinite(t) || t < 0) throw badReplay(`第 ${presses.length + 1} 次按键的 timeMs 必须是非负数`);
-    let timeoutMs = globalTimeout;
-    if (p && p.timeoutMs !== undefined && p.timeoutMs !== null) {
-      timeoutMs = Number(p.timeoutMs);
-      if (!Number.isInteger(timeoutMs) || timeoutMs < 0) {
-        throw badReplay(`第 ${presses.length + 1} 次按键的 timeoutMs 必须是非负整数毫秒`);
-      }
-    }
-    presses.push({ token: canonical.token, pretty: canonical.pretty, timeMs: t, timeoutMs });
-  }
-  for (let i = 1; i < presses.length; i++) {
-    if (presses[i].timeMs < presses[i - 1].timeMs) {
-      throw badReplay(`第 ${i + 1} 次按键的时间早于上一次，时间线必须单调不减`);
-    }
-  }
+  const presses = parsePressList(rawPresses, { globalTimeout, errorFactory: badReplay });
 
   const eff = computeEffective(state, contextId);
   const groups = eff.effectiveGroups;
@@ -2401,6 +2414,238 @@ function checkMigration(state, options = {}) {
   };
 }
 
+/* ================= 连续练习（目标编排 + 录制回放 + DP 对齐评判，只读） ================= */
+
+const PRACTICE_MAX_TARGETS = 20;
+
+const badPractice = (message, details) => {
+  const err = Object.assign(new Error(message), { status: 400 });
+  if (details) err.details = details;
+  return err;
+};
+
+/**
+ * 动态规划对齐：把实际命令流 actual（已按触发时刻展开、同刻按命令 id 升序）
+ * 与目标序列 targets 对齐。三类编辑操作成本各 1，匹配成本 0：
+ *   - 对角：目标 i 与实际 j 对齐，命令相同为 match（0），否则 wrong（错命令，1）；
+ *   - 上行：目标 i 没有对应实际（miss，漏命令，1）；
+ *   - 左行：实际 j 没有对应目标（extra，多触发，1）。
+ * 总成本相同时回溯优先序为：匹配/错命令（对角）→ 漏命令（上行）→ 多触发（左行）。
+ * 实现上按该优先序枚举候选项并在严格更优时替换，平局自然保留最先（最高优先）者。
+ */
+function alignCommandStreams(targets, actual) {
+  const n = targets.length;
+  const m = actual.length;
+  const cost = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  const back = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(null));
+  // back: 'd'（对角）| 'u'（漏命令）| 'l'（多触发）
+
+  for (let i = 1; i <= n; i++) {
+    cost[i][0] = i;
+    back[i][0] = 'u';
+  }
+  for (let j = 1; j <= m; j++) {
+    cost[0][j] = j;
+    back[0][j] = 'l';
+  }
+
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      const same = targets[i - 1].commandId === actual[j - 1].commandId;
+      // 候选项按平局优先序排列：对角（match/wrong）→ 漏 → 多
+      const candidates = [
+        { dir: 'd', c: cost[i - 1][j - 1] + (same ? 0 : 1) },
+        { dir: 'u', c: cost[i - 1][j] + 1 },
+        { dir: 'l', c: cost[i][j - 1] + 1 },
+      ];
+      let best = candidates[0];
+      for (let k = 1; k < candidates.length; k++) {
+        if (candidates[k].c < best.c) best = candidates[k];
+      }
+      cost[i][j] = best.c;
+      back[i][j] = best.dir;
+    }
+  }
+
+  const rows = [];
+  let i = n;
+  let j = m;
+  while (i > 0 || j > 0) {
+    const dir = back[i][j];
+    if (dir === 'd') {
+      const target = targets[i - 1];
+      const actualItem = actual[j - 1];
+      const matched = target.commandId === actualItem.commandId;
+      rows.push({
+        type: matched ? 'match' : 'wrong',
+        typeLabel: matched ? '正确' : '错命令',
+        target: { ...target },
+        actual: { ...actualItem },
+        cost: matched ? 0 : 1,
+      });
+      i--;
+      j--;
+    } else if (dir === 'u') {
+      rows.push({ type: 'miss', typeLabel: '漏命令', target: { ...targets[i - 1] }, actual: null, cost: 1 });
+      i--;
+    } else {
+      rows.push({ type: 'extra', typeLabel: '多触发', target: null, actual: { ...actual[j - 1] }, cost: 1 });
+      j--;
+    }
+  }
+  rows.reverse();
+
+  const stats = { matchedCount: 0, wrongCount: 0, missedCount: 0, extraCount: 0 };
+  rows.forEach((row, idx) => {
+    row.seq = idx + 1;
+    if (row.type === 'match') stats.matchedCount++;
+    else if (row.type === 'wrong') stats.wrongCount++;
+    else if (row.type === 'miss') stats.missedCount++;
+    else stats.extraCount++;
+  });
+  stats.totalErrors = stats.wrongCount + stats.missedCount + stats.extraCount;
+
+  return { totalCost: cost[n][m], rows, stats };
+}
+
+/**
+ * 连续练习评判（纯只读，不修改传入状态、不触碰持久化数据）：
+ * 1. 选择一个上下文，从其生效命令（state !== shadowed）中编排 1~20 个目标命令，
+ *    目标可重复；任一目标不在该上下文中生效（不存在或被覆盖 shadowed）即整体拒绝；
+ * 2. 录制一份带相对毫秒的按键时间线（与 /api/replay 完全相同的格式），后端复用
+ *   replayTimeline 的时序回放规则（前缀待定 / 超时 / 无匹配重新起算不吞键）；
+ *    按键非法、阈值非法、时间倒退等与回放同一口径整体 400，绝不生成部分报告；
+ *    presses 缺省或为空数组视为空录制：回放跳过，全部目标按漏命令处理；
+ * 3. 把回放实际触发按时间展开为命令流（同一时刻多条命令按命令 id 升序），再用
+ *    动态规划与目标序列对齐（匹配 0 / 错命令 / 漏命令 / 多触发各 1；平局回溯
+ *    优先 匹配/错命令 → 漏命令 → 多触发），逐行给出目标、实际、触发时刻与错误类型。
+ *
+ * input:
+ *   { targets: [commandId | { commandId }, ...],          // 1~20 个，可重复
+ *     timeoutMs?: 800,
+ *     presses?: [{ token | press, timeMs, timeoutMs? }] } // 可空：空录制
+ */
+function judgePractice(state, contextId, input, options = {}) {
+  const rawTimeout =
+    options.timeoutMs !== undefined ? options.timeoutMs : input && input.timeoutMs;
+  const globalTimeout =
+    rawTimeout === undefined || rawTimeout === null ? DEFAULT_REPLAY_TIMEOUT_MS : Number(rawTimeout);
+  if (!Number.isInteger(globalTimeout) || globalTimeout < 0) {
+    throw badPractice('超时阈值必须是非负整数毫秒');
+  }
+
+  const eff = computeEffective(state, contextId); // 上下文不存在抛 404
+
+  // ---- 目标序列：必须 1~20 个，且每个目标在当前上下文中生效（非 shadowed）----
+  const rawTargets = Array.isArray(input?.targets) ? input.targets : null;
+  if (!rawTargets) throw badPractice('练习评判需要 targets（目标命令数组）');
+  if (rawTargets.length < 1 || rawTargets.length > PRACTICE_MAX_TARGETS) {
+    throw badPractice(`目标命令数量必须在 1~${PRACTICE_MAX_TARGETS} 之间，当前 ${rawTargets.length} 个`);
+  }
+  const effectiveById = new Map();
+  for (const e of eff.entries) {
+    if (e.state !== 'shadowed') effectiveById.set(e.commandId, e);
+  }
+  const targets = [];
+  rawTargets.forEach((raw, i) => {
+    const commandId =
+      typeof raw === 'string'
+        ? raw.trim()
+        : raw && typeof raw === 'object' && typeof raw.commandId === 'string'
+          ? raw.commandId.trim()
+          : '';
+    if (!commandId) {
+      throw badPractice(`第 ${i + 1} 个目标缺少命令 id（commandId）`, {
+        targetIndex: i,
+        targetSeq: i + 1,
+      });
+    }
+    const entry = effectiveById.get(commandId);
+    if (!entry) {
+      throw badPractice(`第 ${i + 1} 个目标命令在上下文「${eff.contextPath}」中不生效（不存在或已被覆盖 shadowed）：${commandId}`, {
+        targetIndex: i,
+        targetSeq: i + 1,
+        commandId,
+      });
+    }
+    targets.push({
+      commandId: entry.commandId,
+      name: entry.name,
+      description: entry.description || '',
+      contextId: entry.contextId,
+      contextPath: entry.contextPath,
+      sequenceTokens: [...entry.sequenceTokens],
+      sequenceLabel: entry.sequenceLabel,
+      state: entry.state,
+      duplicate: Boolean(entry.duplicate),
+    });
+  });
+
+  // ---- 按键时间线：与 replayTimeline 同一套全量校验；空录制合法（全部漏命令）----
+  const rawPresses = input && Array.isArray(input.presses) ? input.presses : [];
+  const practiceErr = (message, index0) =>
+    badPractice(message, index0 === null || index0 === undefined ? undefined : {
+      pressIndex: index0,
+      pressSeq: index0 + 1,
+    });
+  const presses = parsePressList(rawPresses, {
+    globalTimeout,
+    allowEmpty: true,
+    errorFactory: practiceErr,
+  });
+  const emptyRecording = presses.length === 0;
+
+  // ---- 复用时序回放（待定 / 超时 / 重新起算不吞键），展开实际触发为命令流 ----
+  const replay = emptyRecording ? null : replayTimeline(state, contextId, { presses }, { timeoutMs: globalTimeout });
+
+  const actual = [];
+  if (replay) {
+    const ctxIdByCommand = new Map(eff.entries.map((e) => [e.commandId, e.contextId]));
+    const fired = replay.fired
+      .slice()
+      .sort((a, b) => a.atMs - b.atMs);
+    for (const f of fired) {
+      const commands = f.commands
+        .slice()
+        .sort((a, b) => (a.commandId < b.commandId ? -1 : a.commandId > b.commandId ? 1 : 0));
+      for (const c of commands) {
+        actual.push({
+          triggerIndex: actual.length + 1,
+          atMs: f.atMs,
+          eventType: f.eventType, // press | timeout
+          commandId: c.commandId,
+          name: c.name,
+          contextId: ctxIdByCommand.get(c.commandId) || null,
+          contextPath: c.contextPath,
+          sequenceLabel: c.sequenceLabel,
+          duplicate: Boolean(c.duplicate),
+        });
+      }
+    }
+  }
+
+  const { totalCost, rows, stats } = alignCommandStreams(targets, actual);
+
+  return {
+    format: 'shortcut-practice-report-v1',
+    generatedAt: new Date().toISOString(),
+    contextId,
+    contextPath: eff.contextPath,
+    timeoutMs: globalTimeout,
+    targetCount: targets.length,
+    actualCount: actual.length,
+    pressCount: presses.length,
+    emptyRecording,
+    durationMs: replay ? replay.durationMs : 0,
+    totalCost,
+    stats,
+    targets: targets.map((t, k) => ({ targetSeq: k + 1, ...t })),
+    actual,
+    alignment: rows,
+    replay,
+  };
+}
+
 module.exports = {
   MAX_PRESSES,
   canonicalPress,
@@ -2432,4 +2677,8 @@ module.exports = {
   mapPressToken,
   mapSequenceTokens,
   checkMigration,
+  parsePressList,
+  PRACTICE_MAX_TARGETS,
+  alignCommandStreams,
+  judgePractice,
 };

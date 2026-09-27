@@ -1507,3 +1507,106 @@ select:focus {
   border-color: rgba(245, 181, 68, 0.5);
   background: rgba(245, 181, 68, 0.1);
 }
+
+/* ---------- 连续练习页 ---------- */
+.practice-step {
+  padding: 0;
+}
+.practice-context-select,
+.practice-cmd-select {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 13px;
+  max-width: 420px;
+}
+.practice-cmd-select {
+  flex: 1;
+  min-width: 260px;
+  max-width: none;
+}
+.practice-hint {
+  padding: 10px 14px;
+}
+.practice-target-list {
+  list-style: none;
+  margin: 0;
+  padding: 8px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.target-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(0, 0, 0, 0.16);
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 6px 10px;
+  flex-wrap: wrap;
+}
+.target-row.bad {
+  border-color: rgba(240, 107, 122, 0.7);
+  background: rgba(240, 107, 122, 0.1);
+}
+.target-seq {
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 12.5px;
+  min-width: 30px;
+}
+.target-ops {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 4px;
+}
+.target-ops .link {
+  padding: 1px 6px;
+}
+.practice-recorder {
+  margin: 10px 14px;
+}
+.practice-judge-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  position: sticky;
+  bottom: 0;
+  background: rgba(13, 20, 36, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 14px;
+  backdrop-filter: blur(4px);
+}
+button.big {
+  font-size: 14px;
+  padding: 8px 22px;
+}
+.practice-align-table .align-cmd {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.align-row.row-wrong {
+  background: rgba(240, 107, 122, 0.07);
+}
+.align-row.row-miss {
+  background: rgba(245, 181, 68, 0.06);
+}
+.align-row.row-extra {
+  background: rgba(167, 139, 250, 0.07);
+}
+.practice-align-table .num {
+  font-family: ui-monospace, monospace;
+}
+.press-row.bad {
+  background: rgba(240, 107, 122, 0.12);
+}
+.practice-page .json-details table {
+  margin-top: 10px;
+}
